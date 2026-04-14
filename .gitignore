@@ -5,7 +5,7 @@ pylast/
 PyLyrics/
 pypresence/
 cache/
-user-data/
+user-data*/
 .idea/
 sdl2/
 fonts/
@@ -16,7 +16,6 @@ fonts/
 *.mp3
 build/
 *.bat
-*.idl
 *.tlb
 *.mo
 prime/
@@ -27,3 +26,14 @@ lib/
 *.DS_Store
 dist/
 *.exe
+.dev
+.venv/
+src/tauon_music_box.egg-info
+kissfft.tar.gz
+miniaudio.tar.gz
+debug
+lrclib-solver
+*.dmg
+android-deps
+.buildozer
+bin

@@ -1,0 +1,30 @@
+name: Compile translations on Linux
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      # Install dependencies
+#      - run: pip install whatever
+      - run: sudo apt-get update && sudo apt-get install -y gettext
+      # Build
+#      - run: python setup.py build
+      # Test
+#      - run: python -m pytest tests
+      # Compile translations
+      - run: python -m tools.i18n.compile_translations

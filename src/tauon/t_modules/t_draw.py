@@ -1,0 +1,742 @@
+"""Tauon Music Box - Basic Drawing and Text Drawing Functions Module"""
+
+# Copyright © 2015-2019, Taiko2k captain(dot)gxj(at)gmail.com
+
+#     This file is part of Tauon Music Box.
+#
+#     Tauon Music Box is free software: you can redistribute it and/or modify
+#     it under the terms of the GNU General Public License as published by
+#     the Free Software Foundation, either version 3 of the License, or
+#     (at your option) any later version.
+#
+#     Tauon Music Box is distributed in the hope that it will be useful,
+#     but WITHOUT ANY WARRANTY; without even the implied warranty of
+#     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#     GNU Lesser General Public License for more details.
+#
+#     You should have received a copy of the GNU General Public License
+#     along with Tauon Music Box.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import annotations
+
+import ctypes
+import io
+import logging
+import math
+from collections import OrderedDict
+from ctypes import byref, c_bool, c_float, c_size_t
+from typing import TYPE_CHECKING
+
+import sdl3
+from PIL import Image
+
+from tauon.t_modules.t_extra import ColourRGBA, Timer, alpha_blend, coll_rect
+
+if TYPE_CHECKING:
+	from io import BytesIO
+
+	from tauon.t_modules.t_main import Tauon
+
+try:
+	from jxlpy import JXLImagePlugin
+
+	logging.info("Found jxlpy for JPEG XL support")
+except ModuleNotFoundError:
+	logging.warning("Unable to import jxlpy, JPEG XL support will be disabled.")
+except Exception:
+	logging.exception("Unknown error trying to import jxlpy, JPEG XL support will be disabled.")
+
+
+import sys
+
+if sys.platform == "win32":
+	import os
+
+	os.environ["PANGOCAIRO_BACKEND"] = "fc"
+
+import cairo
+import gi
+
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Pango, PangoCairo
+
+
+class QuickThumbnail:
+	def __init__(self, tauon: Tauon) -> None:
+		self.ddt = tauon.ddt
+		self.renderer = tauon.renderer
+		self.items: list[QuickThumbnail] = []
+		self.queue: list[QuickThumbnail] = []
+		self.rect = sdl3.SDL_FRect(0.0, 0.0)
+		self.texture = None
+		self.surface = None
+		self.size = 50
+		self.alive = False
+		self.url = None
+
+	def destruct(self) -> None:
+		if self.surface:
+			sdl3.SDL_DestroySurface(self.surface)
+			self.surface = None
+		if self.texture:
+			sdl3.SDL_DestroyTexture(self.texture)
+			self.texture = None
+		self.alive = False
+
+	def read_and_thumbnail(self, f: str, width: int, height: int) -> None:
+		g = io.BytesIO()
+		g.seek(0)
+		im = Image.open(f)
+		im.thumbnail((width, height), Image.Resampling.LANCZOS)
+		im.save(g, "PNG")
+		g.seek(0)
+		self.surface = self.ddt.load_image(g)
+		# self.items.append(self)
+		self.alive = True
+
+	def prime(self) -> None:
+		texture = sdl3.SDL_CreateTextureFromSurface(self.renderer, self.surface)
+		sdl3.SDL_DestroySurface(self.surface)
+		self.surface = None
+		tex_w = c_float(0.0)
+		tex_h = c_float(0.0)
+		sdl3.SDL_GetTextureSize(texture, byref(tex_w), byref(tex_h))
+		self.rect.w = int(tex_w.value)
+		self.rect.h = int(tex_h.value)
+		self.texture = texture
+
+	def draw(self, x: int, y: int) -> bool | None:
+		if len(self.items) > 30:
+			img = self.items[0]
+			img.destruct()
+			self.items.remove(img)
+		if not self.alive:
+			if self not in self.queue:
+				self.queue.append(self)
+			return False
+		if not self.texture:
+			self.prime()
+		self.rect.x = round(x)
+		self.rect.y = round(y)
+		sdl3.SDL_RenderTexture(self.renderer, self.texture, None, self.rect)
+
+		return True
+
+
+perf = Timer()
+
+
+class TDraw:
+	def __init__(self, renderer: sdl3.LP_SDL_Renderer) -> None:
+		# All
+		self.renderer = renderer
+		self.scale = 1
+		self.force_subpixel_text = False
+
+		# Drawing
+		self.sdlrect = sdl3.SDL_FRect(10.0, 10.0, 10.0, 10.0)
+
+		# Text and Fonts
+		self.source_rect = sdl3.SDL_FRect(0.0, 0.0, 0.0, 0.0)
+		self.dest_rect = sdl3.SDL_FRect(0.0, 0.0, 0.0, 0.0)
+
+		self.surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 0, 0)
+		self.context = cairo.Context(self.surf)
+		self.layout = PangoCairo.create_layout(self.context)
+
+		self.text_background_colour = ColourRGBA(0, 0, 0, 255)
+		self.pretty_rect: tuple[int, int, int, int] | None = None
+		self.real_bg: bool = False
+		self.alpha_bg: bool = False
+		self.force_gray: bool = False
+		self.f_dict: dict[float, tuple[str, int, float]] = {}
+		self.font_desc_cache: dict[float, Pango.FontDescription] = {}
+		self.ttc: dict[
+			tuple[int, str, int, int, int, int, int, int, int, int],
+			list[sdl3.SDL_FRect | sdl3.LP_SDL_Texture | int | bool],
+		] = {}
+		self.ttl: list[tuple[int, str, int, int, int, int, int, int, int, int]] = []
+		self.text_texture_cache_bytes = 0
+		self.max_text_texture_cache_items = 96
+		self.max_text_texture_cache_bytes = 12 * 1024 * 1024
+		self.max_text_texture_cache_item_bytes = 256 * 1024
+		self.text_wh_cache: OrderedDict[tuple[str, int, int, bool], tuple[int, int]] = OrderedDict()
+		self.max_text_wh_cache_items = 2048
+
+		self.was_truncated = False
+
+	def load_image(self, g: BytesIO) -> sdl3.LP_SDL_Surface:
+		size = g.getbuffer().nbytes
+		pointer = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(g.getbuffer())))
+		stream = sdl3.SDL_IOFromMem(pointer, c_size_t(size))
+		return sdl3.IMG_Load_IO(stream, c_bool(True))
+
+	def rect_s(self, rectangle: tuple[int, int, int, int], colour: ColourRGBA, thickness: int) -> None:
+		sdl3.SDL_SetRenderDrawColor(self.renderer, colour.r, colour.g, colour.b, colour.a)
+		x, y, w, h = (round(x) for x in rectangle)
+		th = math.floor(thickness)
+		self.sdlrect.x = x - th
+		self.sdlrect.y = y - th
+		self.sdlrect.w = th
+		self.sdlrect.h = h + th
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # left
+		self.sdlrect.x = x - th
+		self.sdlrect.y = y + h
+		self.sdlrect.w = w + th
+		self.sdlrect.h = th
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # bottom
+		self.sdlrect.x = x
+		self.sdlrect.y = y - th
+		self.sdlrect.w = w + th
+		self.sdlrect.h = th
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # top
+		self.sdlrect.x = x + w
+		self.sdlrect.y = y
+		self.sdlrect.w = th
+		self.sdlrect.h = h + th
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # right
+
+	def rect_si(self, rectangle: tuple[int, int, int, int], colour: ColourRGBA, thickness: int) -> None:
+		sdl3.SDL_SetRenderDrawColor(self.renderer, colour.r, colour.g, colour.b, colour.a)
+		x, y, w, h = (round(x) for x in rectangle)
+		th = math.floor(thickness)
+		self.sdlrect.x = x
+		self.sdlrect.y = y
+		self.sdlrect.w = th
+		self.sdlrect.h = h
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # left
+		self.sdlrect.x = x
+		self.sdlrect.y = y + (h - th)
+		self.sdlrect.w = w
+		self.sdlrect.h = th
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # bottom
+		self.sdlrect.x = x
+		self.sdlrect.y = y
+		self.sdlrect.w = w
+		self.sdlrect.h = th
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # top
+		self.sdlrect.x = x + (w - th)
+		self.sdlrect.y = y
+		self.sdlrect.w = th
+		self.sdlrect.h = h
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)  # right
+
+	def rect_a(self, location_xy: list[int], size_wh: list[int], colour: ColourRGBA) -> None:
+		self.rect((location_xy[0], location_xy[1], size_wh[0], size_wh[1]), colour)
+
+	def clear_rect(self, rectangle: tuple[int, int, int, int]) -> None:
+		sdl3.SDL_SetRenderDrawBlendMode(self.renderer, sdl3.SDL_BLENDMODE_NONE)
+		sdl3.SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 0)
+
+		self.sdlrect.x = float(rectangle[0])
+		self.sdlrect.y = float(rectangle[1])
+		self.sdlrect.w = float(rectangle[2])
+		self.sdlrect.h = float(rectangle[3])
+
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)
+		sdl3.SDL_SetRenderDrawBlendMode(self.renderer, sdl3.SDL_BLENDMODE_BLEND)
+
+	def rect(self, rectangle: tuple[int, int, int, int], colour: ColourRGBA) -> None:
+		sdl3.SDL_SetRenderDrawColor(self.renderer, colour.r, colour.g, colour.b, colour.a)
+
+		self.sdlrect.x = float(rectangle[0])
+		self.sdlrect.y = float(rectangle[1])
+		self.sdlrect.w = float(rectangle[2])
+		self.sdlrect.h = float(rectangle[3])
+
+		# if fill:
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)
+		# else:
+		# 	sdl3.SDL_RenderDrawRect(self.renderer, self.sdlrect)
+
+	def bordered_rect(
+		self, rectangle: tuple[int, int, int, int], fill_colour: ColourRGBA, outer_colour: ColourRGBA, border_size: int
+	) -> None:
+		self.sdlrect.x = round(rectangle[0]) - border_size
+		self.sdlrect.y = round(rectangle[1]) - border_size
+		self.sdlrect.w = round(rectangle[2]) + border_size + border_size
+		self.sdlrect.h = round(rectangle[3]) + border_size + border_size
+		sdl3.SDL_SetRenderDrawColor(self.renderer, outer_colour.r, outer_colour.g, outer_colour.b, outer_colour.a)
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)
+		self.sdlrect.x = round(rectangle[0])
+		self.sdlrect.y = round(rectangle[1])
+		self.sdlrect.w = round(rectangle[2])
+		self.sdlrect.h = round(rectangle[3])
+		sdl3.SDL_SetRenderDrawColor(self.renderer, fill_colour.r, fill_colour.g, fill_colour.b, fill_colour.a)
+		sdl3.SDL_RenderFillRect(self.renderer, self.sdlrect)
+
+	def line(self, x1: int, y1: int, x2: int, y2: int, colour: ColourRGBA) -> None:
+		sdl3.SDL_SetRenderDrawColor(self.renderer, colour.r, colour.g, colour.b, colour.a)
+		sdl3.SDL_RenderLine(self.renderer, round(x1), round(y1), round(x2), round(y2))
+
+	def get_text_w(self, text: str, font: int, height: bool = False) -> int:
+		x, y = self.get_text_wh(text, font, 3000)
+		if height:
+			return y
+		return x
+
+	def clear_text_cache(self) -> None:
+		for key in self.ttl:
+			so = self.ttc[key]
+			sdl3.SDL_DestroyTexture(so[1])
+
+		self.ttc.clear()
+		self.ttl.clear()
+		self.text_texture_cache_bytes = 0
+		self.text_wh_cache.clear()
+
+	def prime_font(self, name: str, size: float, user_handle: float, offset: int = 0) -> None:
+		self.f_dict[user_handle] = (name + " " + str(size * self.scale), offset, size * self.scale)
+		self.font_desc_cache[user_handle] = Pango.FontDescription(self.f_dict[user_handle][0])
+		self.text_wh_cache.clear()
+
+	def _font_description(self, font: int) -> Pango.FontDescription:
+		cached = self.font_desc_cache.get(font)
+		if cached is not None:
+			return cached
+
+		font_description = Pango.FontDescription(self.f_dict[font][0])
+		self.font_desc_cache[font] = font_description
+		return font_description
+
+	def get_text_wh(self, text: str, font: int, max_x: int, wrap: bool = False) -> tuple[int, int] | None:
+		cache_key = None
+		if len(text) <= 256:
+			cache_key = (text, font, max_x, wrap)
+			cached = self.text_wh_cache.get(cache_key)
+			if cached is not None:
+				self.text_wh_cache.move_to_end(cache_key)
+				return cached
+
+		self.layout.set_font_description(self._font_description(font))
+		self.layout.set_ellipsize(Pango.EllipsizeMode.END)
+		self.layout.set_width(max_x * 1000)
+		if wrap:
+			self.layout.set_height(20000 * 1000)
+		else:
+			self.layout.set_height(0)
+
+		try:
+			self.layout.set_text(text, -1)
+		except Exception:
+			logging.exception(f"Exception in get_text_wh for: {text}")
+			self.layout.set_text(text.encode("utf-8", "replace").decode("utf-8"), -1)
+
+		result = self.layout.get_pixel_size()
+		if cache_key is not None:
+			self.text_wh_cache[cache_key] = result
+			if len(self.text_wh_cache) > self.max_text_wh_cache_items:
+				self.text_wh_cache.popitem(last=False)
+		return result
+
+	def get_y_offset(self, text: str, font: int, max_x: int, wrap: bool = False) -> int:
+		"""HACKY"""
+		self.layout.set_font_description(self._font_description(font))
+		self.layout.set_ellipsize(Pango.EllipsizeMode.END)
+		self.layout.set_width(max_x * 1000)
+		if wrap:
+			self.layout.set_height(20000 * 1000)
+		else:
+			self.layout.set_height(0)
+
+		try:
+			self.layout.set_text(text, -1)
+		except Exception:
+			logging.exception(f"Exception in get_y_offset for: {text}")
+			self.layout.set_text(text.encode("utf-8", "replace").decode("utf-8"), -1)
+
+		y_off = self.layout.get_baseline() / 1000
+		y_off = round(round(y_off) - 13 * self.scale)  # 13 for compat with way text position used to work
+
+		return y_off
+
+	def __render_text(self, key: dict, x: int, y: int, range_top: int, range_height: int, align: int) -> None:
+		sd = key
+
+		if sd[3]:
+			self.was_truncated = True
+
+		if align == 1:
+			sd[0].x = round(x) - sd[0].w
+
+		elif align == 2:
+			sd[0].x -= int(sd[0].w / 2)
+
+		if range_height is not None and range_height < sd[0].h:
+			if range_top < 0:
+				range_top = 0
+
+			if range_top > sd[0].h - range_height:
+				range_top = sd[0].h - range_height
+
+			self.source_rect.y = round(range_top)
+			self.source_rect.w = sd[0].w
+			self.source_rect.h = round(range_height)
+
+			self.dest_rect.x = sd[0].x
+			self.dest_rect.y = sd[0].y
+			self.dest_rect.w = sd[0].w
+			self.dest_rect.h = round(range_height)
+
+			# sdl3.SDL_RenderCopyEx(self.renderer, sd[1], self.source_rect, self.dest_rect, 0, None, 0)
+			sdl3.SDL_RenderTexture(self.renderer, sd[1], self.source_rect, self.dest_rect)
+			return
+
+		sdl3.SDL_RenderTexture(self.renderer, sd[1], None, sd[0])
+
+	def __draw_text_cairo(
+		self,
+		location: list[int],
+		text: str,
+		colour: ColourRGBA,
+		font: int,
+		max_x: int,
+		bg: ColourRGBA,
+		align: int = 0,
+		max_y: int | None = None,
+		wrap: bool = False,
+		range_top: int = 0,
+		range_height: int | None = None,
+		real_bg: bool = False,
+		key: tuple[int, str, int, int, int, int, int, int, int, int] | None = None,
+	) -> int:
+		# perf.set()
+		force_cache = False
+		if key:
+			force_cache = True
+
+		self.was_truncated = False
+
+		max_x += 12  # Hack
+		max_x = round(max_x)
+
+		alpha_bg = self.alpha_bg
+		force_gray = self.force_gray
+		# real_bg = True
+
+		if bg.a < 200:
+			alpha_bg = True
+			force_gray = True
+
+		x = round(location[0])
+		y = round(location[1])
+
+		if self.pretty_rect:
+			w, h = self.get_text_wh(text, font, max_x, wrap)
+			quick_box = [x, y, w, h]
+
+			if align == 1:
+				quick_box[0] = x - quick_box[2]
+			elif align == 2:
+				quick_box[0] -= int(quick_box[2] / 2)
+
+			if coll_rect(self.pretty_rect, quick_box):
+				# self.rect_r(quick_box, [0, 0, 0, 100], True)
+				# if self.real_bg:
+				# real_bg = True
+				alpha_bg = True
+			else:
+				alpha_bg = False
+
+		if alpha_bg:
+			bg = ColourRGBA(0, 0, 0, 0)
+
+		if max_y is not None:
+			max_y = round(max_y)
+
+		if len(text) == 0:
+			return 0
+
+		if key is None:
+			key = (max_x, text, font, colour.r, colour.g, colour.b, colour.a, bg.r, bg.g, bg.b)
+
+		if not real_bg or force_cache:
+			sd = self.ttc.get(key)
+			if sd:
+				sd = self.ttc[key]
+				sd[0].x = round(x)
+				sd[0].y = round(y) - sd[2]
+
+				self.__render_text(sd, x, y, range_top, range_height, align)
+				self.ttl.remove(key)
+				self.ttl.append(key)
+
+				if wrap:
+					return sd[0].h
+				return sd[0].w
+
+		if not self.pretty_rect:  # Would have already done this if True
+			w, h = self.get_text_wh(text, font, max_x, wrap)
+
+		if w < 1:
+			return 0
+
+		h += 4  # Compensate for characters that drop past the baseline, Pango doesn't seem to allow for this
+
+		if wrap:
+			w = max_x + 1
+
+		if font not in self.f_dict:
+			logging.info(f"Font not loaded: {font!s}")
+			return 10
+
+		format = sdl3.SDL_PIXELFORMAT_ARGB8888 if alpha_bg else sdl3.SDL_PIXELFORMAT_XRGB8888
+		surface = None
+		surface_locked = False
+		pixel_data = None
+		data = None
+		surf = None
+		context = None
+		layout = None
+		c = None
+		y_off = 0
+
+		try:
+			if real_bg:
+				box = sdl3.SDL_Rect(x, y - self.get_y_offset(text, font, max_x, wrap), w, h)
+
+				if align == 1:
+					box.x = x - box.w
+				elif align == 2:
+					box.x -= int(box.w / 2)
+
+				ssurf = sdl3.SDL_RenderReadPixels(self.renderer, box)
+				if not ssurf:
+					logging.warning("SDL_RenderReadPixels failed while rendering text background")
+					return 0
+
+				if ssurf.contents.format != format:
+					surface = sdl3.SDL_ConvertSurface(ssurf, format)
+					sdl3.SDL_DestroySurface(ssurf)
+					if not surface:
+						logging.warning("SDL_ConvertSurface failed while rendering text background")
+						return 0
+				else:
+					surface = ssurf
+			else:
+				surface = sdl3.SDL_CreateSurface(w, h, format)
+				if not surface:
+					logging.warning("SDL_CreateSurface failed while rendering text")
+					return 0
+				ctypes.memset(surface.contents.pixels, 0, surface.contents.pitch * h)
+
+			if not sdl3.SDL_LockSurface(surface):
+				logging.warning("SDL_LockSurface failed while rendering text")
+				return 0
+			surface_locked = True
+
+			pixel_size = surface.contents.pitch * h
+			pixel_data = (ctypes.c_ubyte * pixel_size).from_address(surface.contents.pixels)
+			data = memoryview(pixel_data)
+
+			if alpha_bg:
+				surf = cairo.ImageSurface.create_for_data(data, cairo.FORMAT_ARGB32, w, h, surface.contents.pitch)
+			else:
+				surf = cairo.ImageSurface.create_for_data(data, cairo.FORMAT_RGB24, w, h, surface.contents.pitch)
+
+			context = cairo.Context(surf)
+
+			if force_gray:
+				options = context.get_font_options()
+				options.set_antialias(cairo.ANTIALIAS_GRAY)
+				# options.set_hint_style(cairo.HINT_STYLE_NONE)
+				context.set_font_options(options)
+			elif self.force_subpixel_text:
+				options = context.get_font_options()
+				# options.set_antialias(cairo.ANTIALIAS_NONE)
+				# options.set_antialias(cairo.ANTIALIAS_GRAY)
+				options.set_antialias(cairo.ANTIALIAS_SUBPIXEL)
+				context.set_font_options(options)
+
+			layout = PangoCairo.create_layout(context)
+			layout.set_auto_dir(False)
+
+			if max_y is not None:
+				layout.set_ellipsize(Pango.EllipsizeMode.END)
+				layout.set_width(max_x * 1000)
+				layout.set_height(max_y * 1000)
+			else:
+				layout.set_ellipsize(Pango.EllipsizeMode.END)
+				layout.set_width(max_x * 1000)
+
+				extra = 0
+				if wrap:  # Compensate for height measurement being 1-2 lines too short. Pango bug?
+					extra = round(400000 * self.scale)
+
+				layout.set_height(h * 1000 + extra)
+
+			if not wrap and max_y is None:
+				layout.set_height(-1)
+
+			# Attributes don't seem to be implemented in gi?
+			# attrs = Pango.AttrList()
+			# attrs.insert(Pango.Attribute(Pango.Underline.SINGLE))
+			# layout.set_attributes(attrs)
+
+			context.rectangle(0, 0, w, h)
+
+			if not real_bg and not alpha_bg:
+				context.set_source_rgb(bg.r / 255, bg.g / 255, bg.b / 255)
+				# context.set_source_rgba(0, 0, 0, 0)
+				context.fill()
+
+			context.set_source_rgb(colour.r / 255, colour.g / 255, colour.b / 255)
+
+			# desc = Pango.FontDescription(self.f_dict[font][0])
+			# desc.set_family("Arial")
+
+			layout.set_font_description(self._font_description(font))
+
+			try:
+				layout.set_text(text, -1)
+			except Exception:
+				logging.exception(f"Text error on text: {text}")
+				layout.set_text(text.encode("utf-8", "replace").decode("utf-8"), -1)
+
+			# logging.info(layout.get_direction(0))
+
+			y_off = layout.get_baseline() / 1000
+			y_off = round(round(y_off) - 13 * self.scale)  # 13 for compat with way text position used to work
+
+			PangoCairo.show_layout(context, layout)
+
+			self.was_truncated = layout.is_ellipsized()
+			surf.flush()
+			surf.finish()
+			surf = None
+			layout = None
+			context = None
+			data.release()
+			data = None
+			pixel_data = None
+			sdl3.SDL_UnlockSurface(surface)
+			surface_locked = False
+
+			# Here the background colour is keyed out allowing lines to overlap slightly
+			if not real_bg and not alpha_bg:
+				format_details = sdl3.SDL_GetPixelFormatDetails(format)
+				ke = sdl3.SDL_MapRGB(format_details, None, bg.r, bg.g, bg.b)
+				sdl3.SDL_SetSurfaceColorKey(surface, True, ke)
+
+			c = sdl3.SDL_CreateTextureFromSurface(self.renderer, surface)
+			if not c:
+				logging.warning("SDL_CreateTextureFromSurface failed while rendering text")
+				return 0
+
+			sdl3.SDL_DestroySurface(surface)
+			surface = None
+
+			if alpha_bg:
+				blend_mode = sdl3.SDL_ComposeCustomBlendMode(
+					sdl3.SDL_BLENDFACTOR_ONE,
+					sdl3.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+					sdl3.SDL_BLENDOPERATION_ADD,
+					sdl3.SDL_BLENDFACTOR_ONE,
+					sdl3.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+					sdl3.SDL_BLENDOPERATION_ADD,
+				)
+				sdl3.SDL_SetTextureBlendMode(c, blend_mode)
+		finally:
+			layout = None
+			context = None
+			if surf is not None:
+				surf.finish()
+			if data is not None:
+				data.release()
+			pixel_data = None
+			if surface_locked and surface is not None:
+				sdl3.SDL_UnlockSurface(surface)
+			if surface is not None:
+				sdl3.SDL_DestroySurface(surface)
+
+		dst = sdl3.SDL_FRect(round(x), round(y))
+		dst.w = round(w)
+		dst.h = round(h)
+		dst.y = round(y) - y_off
+
+		pack = [dst, c, y_off, self.was_truncated]
+		cache_item_bytes = w * h * 4
+		texture_cached = False
+
+		try:
+			self.__render_text(pack, x, y, range_top, range_height, align)
+
+			# Don't cache if using real background data
+			cache_texture = not real_bg and (
+				force_cache or cache_item_bytes <= self.max_text_texture_cache_item_bytes
+			)
+			if cache_texture:
+				pack.append(cache_item_bytes)
+				self.ttc[key] = pack
+				self.ttl.append(key)
+				self.text_texture_cache_bytes += cache_item_bytes
+				texture_cached = True
+				while (
+					len(self.ttl) > self.max_text_texture_cache_items
+					or self.text_texture_cache_bytes > self.max_text_texture_cache_bytes
+				):
+					key = self.ttl[0]
+					so = self.ttc[key]
+					sdl3.SDL_DestroyTexture(so[1])
+					if len(so) > 4:
+						self.text_texture_cache_bytes -= so[4]
+					del self.ttc[key]
+					del self.ttl[0]
+		finally:
+			if c is not None and not texture_cached:
+				sdl3.SDL_DestroyTexture(c)
+
+		if wrap:
+			return dst.h
+		return dst.w
+
+	def text(
+		self,
+		location: list[int],
+		text: str,
+		colour: ColourRGBA,
+		font: int,
+		max_w: int = 4000,
+		bg: ColourRGBA | None = None,
+		range_top: int = 0,
+		range_height: int | None = None,
+		real_bg: bool = False,
+		key: tuple[int, str, int, int, int, int, int, int, int, int] | None = None,
+	) -> int | None:
+		# logging.info((text, font))
+
+		if not text:
+			return 0
+
+		max_w = max(1, max_w)
+
+		if bg is None:
+			bg = self.text_background_colour
+
+		if colour.a != 255:
+			colour = alpha_blend(colour, bg)
+		align = 0
+		if len(location) > 2:
+			if location[2] == 1:
+				align = 1
+			if location[2] == 2:
+				align = 2
+			if location[2] == 4:
+				max_h = None
+				if len(location) > 4:
+					max_h = location[4]
+
+				return self.__draw_text_cairo(
+					location,
+					text,
+					colour,
+					font,
+					location[3],
+					bg,
+					max_y=max_h,
+					wrap=True,
+					range_top=range_top,
+					range_height=range_height,
+				)
+
+		return self.__draw_text_cairo(location, text, colour, font, max_w, bg, align, real_bg=real_bg, key=key)
